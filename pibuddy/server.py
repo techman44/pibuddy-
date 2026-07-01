@@ -28,12 +28,11 @@ import time
 import aiohttp
 from aiohttp import web
 
+from .bleproto import clamp_wait
 from .state import StateStore, escalation_tier
 
 log = logging.getLogger("pibuddy.server")
 
-MAX_APPROVAL_WAIT = 120.0
-DEFAULT_APPROVAL_WAIT = 45.0
 POLL_INTERVAL = 0.1
 RELAY_CHECK_INTERVAL = 10.0
 
@@ -149,11 +148,7 @@ def build_app(store: StateStore, token: str = "", ntfy_url: str = "", relay_afte
         # The approval also counts as activity for the session.
         store.apply_event({**payload, "hook_event_name": "PreToolUse"})
 
-        try:
-            wait = float(request.query.get("wait", DEFAULT_APPROVAL_WAIT))
-        except ValueError:
-            wait = DEFAULT_APPROVAL_WAIT
-        wait = max(1.0, min(wait, MAX_APPROVAL_WAIT))
+        wait = clamp_wait(request.query.get("wait"))
 
         req = store.add_approval(payload)
         loop = asyncio.get_running_loop()
