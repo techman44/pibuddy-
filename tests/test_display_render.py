@@ -72,11 +72,13 @@ def test_approval_overlay_and_touch(size):
         }
     )
     d._draw(store.snapshot())
-    approve_rect, _ = d._approval_button_rects()
+    approve_rect, terminal_rect, deny_rect = d._approval_button_rects()
     assert d._hit_approval_buttons(*approve_rect.center)
     assert req.decision == "allow"
     # Buttons are big enough for fingers (>= 48px).
     assert approve_rect.height >= 48
+    assert not approve_rect.colliderect(terminal_rect)
+    assert not terminal_rect.colliderect(deny_rect)
 
 
 @pytest.mark.parametrize("rotate", (0, 90, 180, 270))

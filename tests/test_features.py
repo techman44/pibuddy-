@@ -256,9 +256,70 @@ def test_approval_queue_navigation_and_selected_resolve():
     b = store.add_approval(event("PreToolUse", tool_name="Write", sid="s2"))
     d._draw(store.snapshot())
     d.approval_index = 1  # select the second approval
-    approve, _ = d._approval_button_rects()
+    approve, _, _ = d._approval_button_rects()
     assert d._hit_approval_buttons(*approve.center)
     assert b.decision == "allow" and a.decision is None
+
+
+def test_terminal_button_passes_to_terminal():
+    d, store = make_display()
+    req = store.add_approval(event("PreToolUse", tool_name="Bash"))
+    d._draw(store.snapshot())
+    _, terminal, _ = d._approval_button_rects()
+    assert d._hit_approval_buttons(*terminal.center)
+    assert req.decision == "pass"  # hook stays silent -> terminal prompt
+
+
+def test_rich_approval_fields_and_render():
+    d, store = make_display()
+    store.add_approval(
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "npm run deploy -- --prod",
+                "description": "Deploy the site to production",
+            },
+            "pibuddy_context": "Build passed, ready to ship. I'll deploy now.",
+        }
+    )
+    snap = store.snapshot()
+    req = snap.approvals[0]
+    assert req.description == "Deploy the site to production"
+    assert "ready to ship" in req.context
+    d._draw(snap)
+
+
+def test_approval_with_question_options_renders():
+    d, store = make_display()
+    store.add_approval(
+        {
+            "session_id": "s1",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {
+                "questions": [
+                    {
+                        "question": "Which database should we use?",
+                        "options": [{"label": "Postgres"}, {"label": "SQLite"}],
+                    }
+                ]
+            },
+        }
+    )
+    snap = store.snapshot()
+    assert snap.approvals[0].questions == (
+        ("Which database should we use?", ("Postgres", "SQLite")),
+    )
+    d._draw(snap)
+
+
+def test_approval_fallback_detail_from_input():
+    store = StateStore()
+    store.add_approval(
+        {"session_id": "s", "tool_name": "Fetch", "tool_input": {"method": "GET", "target": "example"}}
+    )
+    req = store.snapshot().approvals[0]
+    assert "method: GET" in req.detail
 
 
 def test_clock_mode_renders():

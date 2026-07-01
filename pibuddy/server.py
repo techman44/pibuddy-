@@ -90,9 +90,13 @@ async function refresh() {
     for (const a of s.approvals) {
       const card = document.createElement("div");
       card.className = "card";
-      card.innerHTML = `<div class="tool"></div><div class="detail"></div>`;
+      card.innerHTML = `<div class="tool"></div><div class="desc"></div>
+        <div class="detail"></div><div class="ctx muted"></div>`;
       card.querySelector(".tool").textContent = "Claude wants: " + a.tool_name;
+      card.querySelector(".desc").textContent = a.description || "";
       card.querySelector(".detail").textContent = a.detail || "";
+      card.querySelector(".ctx").textContent =
+        a.context ? "Claude: “" + a.context + "”" : "";
       const ok = document.createElement("button"); ok.className = "ok";
       ok.textContent = "Approve"; ok.onclick = () => decide(a.request_id, "allow");
       const no = document.createElement("button"); no.className = "no";
@@ -203,6 +207,8 @@ def build_app(store: StateStore, token: str = "", ntfy_url: str = "", relay_afte
                         "request_id": a.request_id,
                         "tool_name": a.tool_name,
                         "detail": a.detail,
+                        "description": a.description,
+                        "context": a.context,
                         "session_id": a.session_id,
                     }
                     for a in snap.approvals

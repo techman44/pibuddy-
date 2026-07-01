@@ -26,10 +26,15 @@ tool call right on the Pi**.
   forwarded fire-and-forget by `hooks/pibuddy-event.sh` — with a 2 s timeout in
   the background, so a powered-off Pi never slows a session down.
 * Optionally, a blocking `PreToolUse` hook (`hooks/pibuddy-approve.sh`) holds
-  the tool call while the Pi shows an Approve / Deny overlay. Tap a button and
-  the decision flows back as a `permissionDecision`. If nobody taps in time,
-  the hook stays silent and Claude Code falls back to its normal terminal
-  prompt.
+  the tool call while the Pi shows a rich approval overlay: the tool, what
+  Claude says the call is for, the exact command in a panel, **Claude's last
+  message from the transcript as context** (extracted on your laptop by the
+  hook — transcripts never leave it unless you enable this hook), and any
+  options the tool call is asking you to choose between. Three buttons:
+  **Approve**, **Deny**, and **Terminal…** — the latter (like a timeout or an
+  unreachable Pi) leaves the hook silent so Claude Code falls back to its
+  normal terminal prompt with the full option list (e.g. "yes, don't ask
+  again").
 * Multiple sessions are tracked independently (one status dot each) and
   aggregated into a single mood: `attention > dizzy > heart > celebrate >
   busy > idle > sleep` — the same seven states as the original Buddy.

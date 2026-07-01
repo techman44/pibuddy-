@@ -88,7 +88,10 @@ class Approval:
     tool_name: str
     detail: str
     created: float
-    decision: str | None = None  # "allow" | "deny"
+    description: str = ""  # human-readable summary from tool_input
+    context: str = ""  # Claude's last message, extracted client-side
+    questions: tuple = ()  # ((question, (option, ...)), ...) if the tool asks
+    decision: str | None = None  # "allow" | "deny" | "pass"
     decided_at: float = 0.0
 
 
@@ -223,19 +226,37 @@ class StateStore:
     def add_approval(self, payload: dict[str, Any]) -> Approval:
         tool = str(payload.get("tool_name", "tool"))
         tool_input = payload.get("tool_input") or {}
-        detail = ""
+        detail, description = "", ""
+        questions: list[tuple[str, tuple[str, ...]]] = []
         if isinstance(tool_input, dict):
             detail = str(
                 tool_input.get("command")
                 or tool_input.get("file_path")
-                or tool_input.get("description")
+                or tool_input.get("url")
+                or tool_input.get("pattern")
                 or ""
             )
+            description = str(tool_input.get("description") or "")
+            # Tools that present choices (e.g. AskUserQuestion) carry them in
+            # the input — surface them so you can see what's being asked.
+            for q in tool_input.get("questions") or []:
+                if isinstance(q, dict) and q.get("question"):
+                    options = tuple(
+                        str(o.get("label", o)) if isinstance(o, dict) else str(o)
+                        for o in (q.get("options") or [])
+                    )
+                    questions.append((str(q["question"]), options))
+        if not detail and not description and isinstance(tool_input, dict) and tool_input:
+            # Fall back to a compact key/value rendering of the input.
+            detail = "  ".join(f"{k}: {str(v)[:60]}" for k, v in list(tool_input.items())[:4])
         req = Approval(
             request_id=uuid.uuid4().hex,
             session_id=str(payload.get("session_id") or "unknown"),
             tool_name=tool,
             detail=detail,
+            description=description,
+            context=str(payload.get("pibuddy_context") or "")[:600],
+            questions=tuple(questions),
             created=self._clock(),
         )
         with self._lock:
@@ -258,7 +279,9 @@ class StateStore:
                 req.decided_at = now
                 if decision == "allow" and now - req.created <= FAST_APPROVAL_SECS:
                     self._heart_until = now + HEART_SECS
-                verdict = "approved" if decision == "allow" else "denied"
+                verdict = {"allow": "approved", "deny": "denied"}.get(
+                    decision, "sent to terminal"
+                )
                 self._log.appendleft(
                     LogEntry(
                         when=time.time(),

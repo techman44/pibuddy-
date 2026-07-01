@@ -338,7 +338,7 @@ class Display:
                 self.store.trigger_dizzy()
 
     def _hit_approval_buttons(self, x: float, y: float) -> bool:
-        approve, deny = self._approval_button_rects()
+        approve, terminal, deny = self._approval_button_rects()
         snap = self.store.snapshot()
         selected = None
         if snap.approvals:
@@ -352,6 +352,12 @@ class Display:
         if deny.collidepoint(x, y):
             if self.store.resolve_approval("deny", rid):
                 self.sounds.deny()
+            self.approval_index = 0
+            return True
+        if terminal.collidepoint(x, y):
+            # "pass" -> the hook stays silent and the terminal shows its
+            # normal prompt with the full option list.
+            self.store.resolve_approval("pass", rid)
             self.approval_index = 0
             return True
         return False
@@ -791,63 +797,114 @@ class Display:
     # Approval overlay
     # ------------------------------------------------------------------
 
-    def _approval_button_rects(self) -> tuple[pygame.Rect, pygame.Rect]:
-        btn_h = max(48, int(self.h * 0.2))
-        btn_w = int(self.w * 0.4)
-        gap = int(self.w * 0.06)
-        y = self.h - btn_h - int(self.h * 0.06)
-        approve = pygame.Rect(self.w // 2 - btn_w - gap // 2, y, btn_w, btn_h)
-        deny = pygame.Rect(self.w // 2 + gap // 2, y, btn_w, btn_h)
-        return approve, deny
+    def _approval_button_rects(self) -> tuple[pygame.Rect, pygame.Rect, pygame.Rect]:
+        """Approve / Decide-in-terminal / Deny."""
+        btn_h = max(48, int(self.h * 0.18))
+        gap = int(self.w * 0.03)
+        btn_w = (self.w - gap * 4) // 3
+        y = self.h - btn_h - int(self.h * 0.05)
+        approve = pygame.Rect(gap, y, btn_w, btn_h)
+        terminal = pygame.Rect(gap * 2 + btn_w, y, btn_w, btn_h)
+        deny = pygame.Rect(gap * 3 + btn_w * 2, y, btn_w, btn_h)
+        return approve, terminal, deny
 
     def _draw_approval(self, snap: Snapshot) -> None:
         veil = pygame.Surface((self.w, self.h))
         veil.fill((10, 8, 14))
-        veil.set_alpha(235)
+        veil.set_alpha(245)
         self.canvas.blit(veil, (0, 0))
 
         total = len(snap.approvals)
         req = snap.approvals[self.approval_index % total]
-        pad = int(self.unit * 0.05)
-        f_small = self.font(int(self.unit * 0.055))
-        f_tool = self.font(int(self.unit * 0.1))
-        f_detail = self.font(int(self.unit * 0.06))
+        pad = int(self.unit * 0.045)
+        f_small = self.font(int(self.unit * 0.05))
+        f_tool = self.font(int(self.unit * 0.09))
+        f_body = self.font(int(self.unit * 0.055))
 
+        approve_rect, _, _ = self._approval_button_rects()
+        bottom = approve_rect.top - pad
         y = pad
+
         heading = "Claude wants to use:"
         if total > 1:
             heading = f"Claude wants to use:   ({self.approval_index % total + 1} of {total} — swipe)"
         head = f_small.render(heading, True, ATTN)
         self.canvas.blit(head, (pad, y))
-        y += head.get_height() + pad // 2
+        y += head.get_height() + pad // 3
 
-        tool = f_tool.render(req.tool_name, True, FG)
-        self.canvas.blit(tool, (pad, y))
-        y += tool.get_height() + pad // 2
-
-        approve_rect, _ = self._approval_button_rects()
-        detail_bottom = approve_rect.top - pad
-        for line in _wrap(req.detail, f_detail, self.w - pad * 2):
-            if y + f_detail.get_height() > detail_bottom:
-                break
-            label = f_detail.render(line, True, MUTED)
-            self.canvas.blit(label, (pad, y))
-            y += int(f_detail.get_height() * 1.15)
-
+        tool_line = req.tool_name
         elapsed = int(time.monotonic() - req.created)
+        tool = f_tool.render(tool_line, True, FG)
+        self.canvas.blit(tool, (pad, y))
         stamp = f_small.render(
-            f"session {req.session_id[:8]} · waiting {elapsed}s", True, MUTED
+            f"session {req.session_id[:8]} · {elapsed}s", True, MUTED
         )
-        self.canvas.blit(stamp, (pad, detail_bottom - stamp.get_height()))
+        self.canvas.blit(
+            stamp, (self.w - stamp.get_width() - pad, y + tool.get_height() - stamp.get_height())
+        )
+        y += tool.get_height() + pad // 3
 
-        approve, deny = self._approval_button_rects()
-        f_btn = self.font(int(approve.height * 0.42))
-        pygame.draw.rect(self.canvas, GOOD, approve, border_radius=approve.height // 5)
-        pygame.draw.rect(self.canvas, BAD, deny, border_radius=deny.height // 5)
-        a_label = f_btn.render("Approve", True, (12, 30, 18))
-        d_label = f_btn.render("Deny", True, (35, 12, 12))
-        self.canvas.blit(a_label, a_label.get_rect(center=approve.center))
-        self.canvas.blit(d_label, d_label.get_rect(center=deny.center))
+        # What Claude says this call is for.
+        if req.description:
+            y = self._wrapped_block(req.description, f_body, ATTN, pad, y, bottom, max_lines=2)
+
+        # The exact command/input, in its own panel.
+        if req.detail:
+            y = self._panel_block(req.detail, f_body, pad, y, bottom, max_frac=0.34)
+
+        # Options the tool is asking you to choose between (answer in
+        # the terminal — the Pi can only allow/deny the call itself).
+        for question, options in req.questions:
+            y = self._wrapped_block(f"? {question}", f_body, FG, pad, y, bottom, max_lines=2)
+            for opt in options[:4]:
+                y = self._wrapped_block(f"   ◦ {opt}", f_body, MUTED, pad, y, bottom, max_lines=1)
+
+        # Context: the last thing Claude said before asking.
+        if req.context and y < bottom - f_body.get_height() * 2:
+            y += pad // 3
+            y = self._wrapped_block("Claude's last message:", f_small, MUTED, pad, y, bottom, max_lines=1)
+            y = self._wrapped_block(req.context, f_body, (190, 188, 205), pad, y, bottom)
+
+        approve, terminal, deny = self._approval_button_rects()
+        f_btn = self.font(int(approve.height * 0.36))
+        for rect, color, label, fg in (
+            (approve, GOOD, "Approve", (12, 30, 18)),
+            (terminal, BG_PANEL, "Terminal…", FG),
+            (deny, BAD, "Deny", (35, 12, 12)),
+        ):
+            pygame.draw.rect(self.canvas, color, rect, border_radius=rect.height // 5)
+            text = f_btn.render(label, True, fg)
+            self.canvas.blit(text, text.get_rect(center=rect.center))
+
+    def _wrapped_block(
+        self, text: str, font: pygame.font.Font, color, pad: int, y: int, bottom: int,
+        max_lines: int = 99,
+    ) -> int:
+        for i, line in enumerate(_wrap(text, font, self.w - pad * 2)):
+            if i >= max_lines or y + font.get_height() > bottom:
+                break
+            self.canvas.blit(font.render(line, True, color), (pad, y))
+            y += int(font.get_height() * 1.12)
+        return y
+
+    def _panel_block(
+        self, text: str, font: pygame.font.Font, pad: int, y: int, bottom: int, max_frac: float
+    ) -> int:
+        lines = _wrap(text, font, self.w - pad * 3)
+        line_h = int(font.get_height() * 1.15)
+        max_h = min(int(self.h * max_frac), bottom - y - pad // 2)
+        n = max(1, min(len(lines), max_h // line_h))
+        if n <= 0 or y >= bottom:
+            return y
+        panel = pygame.Rect(pad, y, self.w - pad * 2, n * line_h + pad // 2)
+        pygame.draw.rect(self.canvas, BG_PANEL, panel, border_radius=pad // 3)
+        ty = y + pad // 4
+        for line in lines[:n]:
+            if n < len(lines) and line is lines[n - 1]:
+                line = line[: max(1, len(line) - 1)] + "…"
+            self.canvas.blit(font.render(line, True, FG), (pad + pad // 2, ty))
+            ty += line_h
+        return panel.bottom + pad // 2
 
 
 def _wrap(text: str, font: pygame.font.Font, width: int) -> list[str]:
