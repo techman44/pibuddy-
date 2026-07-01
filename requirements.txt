@@ -1,0 +1,7 @@
+aiohttp>=3.9
+pygame>=2.5
+Pillow>=10.0
+segno>=1.6
+zeroconf>=0.130
+# Optional, only for experimental --ble mode on the Pi:
+# bluezero>=0.9
