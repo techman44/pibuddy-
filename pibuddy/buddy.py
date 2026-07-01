@@ -41,8 +41,19 @@ def _wobble(t: float, speed: float, amount: float) -> float:
     return math.sin(t * speed) * amount
 
 
-def draw(surface: pygame.Surface, rect: pygame.Rect, mood: str, t: float) -> None:
-    """Draw Clawd in `mood` at animation time `t` (seconds), inside rect."""
+def draw(
+    surface: pygame.Surface,
+    rect: pygame.Rect,
+    mood: str,
+    t: float,
+    intensity: float = 1.0,
+    level: int = 1,
+) -> None:
+    """Draw Clawd in `mood` at animation time `t` (seconds), inside rect.
+
+    `intensity` (>= 1.0) exaggerates the attention animation as an
+    unanswered prompt escalates; `level` unlocks accessories.
+    """
     u = min(rect.width, rect.height)  # scale unit
     cx = rect.centerx
     cy = rect.centery + int(u * 0.04)
@@ -55,7 +66,7 @@ def draw(surface: pygame.Surface, rect: pygame.Rect, mood: str, t: float) -> Non
     tilt = 0
     breathe = 1.0 + 0.012 * math.sin(t * 2.2)
     if mood == st.ATTENTION:
-        dy = -abs(int(_wobble(t, 9, u * 0.035)))
+        dy = -abs(int(_wobble(t, 9 * min(intensity, 2.0), u * 0.035 * intensity)))
     elif mood == st.CELEBRATE:
         dy = -abs(int(_wobble(t, 7, u * 0.055)))
     elif mood == st.HEART:
@@ -91,6 +102,7 @@ def draw(surface: pygame.Surface, rect: pygame.Rect, mood: str, t: float) -> Non
 
     # Body.
     pygame.draw.rect(surface, color, body, border_radius=radius)
+    _accessories(surface, body, u, level, mood, t)
 
     eye_y = body.centery - int(bh * 0.08)
     eye_dx = int(bw * 0.19)
@@ -117,6 +129,41 @@ def draw(surface: pygame.Surface, rect: pygame.Rect, mood: str, t: float) -> Non
         _sweat(surface, body, u, t)
     else:  # idle
         _bar_eyes(surface, body, eye_dx, eye_y, eye_w, eye_h, t)
+
+
+def _accessories(surface, body, u, level, mood, t):
+    """Level rewards: bow tie at 3, party hat at 5, crown at 10+."""
+    if level >= 3:
+        # Bow tie at the bottom edge.
+        s = max(4, int(u * 0.045))
+        cx, cy = body.centerx, body.bottom - int(s * 1.2)
+        color = (90, 60, 140)
+        pygame.draw.polygon(surface, color, [(cx - s * 2, cy - s), (cx, cy), (cx - s * 2, cy + s)])
+        pygame.draw.polygon(surface, color, [(cx + s * 2, cy - s), (cx, cy), (cx + s * 2, cy + s)])
+        pygame.draw.circle(surface, color, (cx, cy), max(2, s // 2))
+    if 5 <= level < 10:
+        # Party hat, tilted to the side.
+        s = int(u * 0.14)
+        base_x = body.centerx + int(body.width * 0.22)
+        base_y = body.top + int(u * 0.01)
+        tip = (base_x + int(s * 0.35), base_y - s)
+        pygame.draw.polygon(
+            surface, (100, 170, 230),
+            [(base_x - int(s * 0.5), base_y), (base_x + int(s * 0.5), base_y), tip],
+        )
+        pygame.draw.circle(surface, (250, 210, 90), tip, max(3, int(u * 0.02)))
+    elif level >= 10:
+        # A little crown.
+        s = int(u * 0.1)
+        cx = body.centerx
+        base_y = body.top + int(u * 0.005)
+        gold = (245, 195, 70)
+        points = [(cx - s, base_y)]
+        for i in range(3):
+            px = cx - s + (i * s) + s // 2
+            points += [(px, base_y - s + int(_wobble(t, 3, 2))), (px + s // 2, base_y - s // 3)]
+        points[-1] = (cx + s, base_y)
+        pygame.draw.polygon(surface, gold, points + [(cx + s, base_y + s // 3), (cx - s, base_y + s // 3)])
 
 
 def _bar_eyes(surface, body, dx, y, w, h, t, dart=False):

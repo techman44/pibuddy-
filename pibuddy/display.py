@@ -1,9 +1,14 @@
 """Resolution-independent, touch-first UI.
 
-Three swipeable screens (pet / activity feed / stats) plus a modal
-approval overlay. Every dimension is derived from the actual display
-size at startup, so the same code runs on a 3.5" 480x320 SPI hat and a
-10" 1280x800 DSI panel, portrait or landscape (see --rotate).
+Three swipeable screens (pet / activity feed / stats) plus overlays:
+a modal approval prompt (with queue navigation when several are
+pending), a per-session detail card, and a long-press settings menu
+with an exit button. When the buddy sleeps and the screen dims, an
+ambient clock takes over.
+
+Every dimension is derived from the actual display size at startup, so
+the same code runs on a 3.5" 480x320 SPI hat and a 10" 1280x800 DSI
+panel, portrait or landscape (see --rotate).
 
 Touch handling: SDL reports touchscreens both as FINGER* events and as
 synthesized mouse events; we listen to FINGER* plus real-mouse-only
@@ -13,17 +18,21 @@ events so a desktop mouse works in development windows too.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import math
 import socket
+import threading
 import time
+import urllib.request
 
 import pygame
 
 from . import buddy as vector_buddy
 from . import state as st
 from .characters import CharacterPack
-from .state import StateStore, Snapshot
+from .sound import Sounds
+from .state import StateStore, Snapshot, escalation_tier, session_mood
 
 log = logging.getLogger("pibuddy.display")
 
@@ -35,6 +44,7 @@ ACCENT = (240, 160, 90)
 GOOD = (95, 190, 120)
 BAD = (225, 95, 85)
 ATTN = (250, 190, 60)
+URGENT = (235, 80, 70)
 
 KIND_COLORS = {
     "tool": (120, 180, 240),
@@ -58,6 +68,8 @@ SCREENS = ("pet", "feed", "stats")
 SWIPE_FRACTION = 0.12  # of screen width
 TAP_MAX_PX_FRACTION = 0.02
 TAP_MAX_SECS = 0.5
+LONG_PRESS_SECS = 1.2
+ALERT_REPEAT_SECS = 15.0
 
 
 def _local_addresses() -> list[str]:
@@ -75,19 +87,38 @@ def _local_addresses() -> list[str]:
     return addrs
 
 
+def _make_qr(text: str) -> list[list[bool]] | None:
+    try:
+        import segno
+    except ImportError:
+        return None
+    qr = segno.make(text, error="m")
+    return [[bool(v) for v in row] for row in qr.matrix]
+
+
 class Display:
     def __init__(self, store: StateStore, config) -> None:
         self.store = store
         self.config = config
         self.pack: CharacterPack | None = None
+        self.sounds = Sounds(enabled=getattr(config, "sound", False))
+        self.grid_enabled = bool(getattr(config, "grid", False))
         self.screen_index = 0
         self.feed_scroll = 0.0
+        self.approval_index = 0
+        self.overlay: str | None = None  # None | "settings" | "sessions"
+        self.weather_text = ""
         self._fonts: dict[int, pygame.font.Font] = {}
         self._pointer_down: tuple[float, float, float] | None = None  # x, y, t
+        self._pointer_moved = 0.0
         self._drag_last_y: float | None = None
         self._recent_taps: list[float] = []
         self._last_interaction = time.monotonic()
         self._started = time.monotonic()
+        self._prev_mood = st.SLEEP
+        self._last_alert = 0.0
+        self._qr_cache: tuple[str, pygame.Surface] | None = None
+        self._settings_rects: list[tuple[pygame.Rect, str]] = []
 
     # ------------------------------------------------------------------
     # Setup
@@ -163,11 +194,13 @@ class Display:
             self.pack = load_pack(self.config.character_pack)
             if self.pack:
                 log.info("loaded character pack '%s'", self.pack.name)
+        self._start_weather()
 
         clock = pygame.time.Clock()
         running = True
         while running:
             snap = self.store.snapshot()
+            self._sound_cues(snap)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -178,6 +211,7 @@ class Display:
                     running = False
                 else:
                     self._handle_pointer(event, snap)
+            self._check_long_press(snap)
 
             self._draw(snap)
             if self.rotate:
@@ -186,6 +220,19 @@ class Display:
             pygame.display.flip()
             clock.tick(self.config.fps)
         pygame.quit()
+
+    def _sound_cues(self, snap: Snapshot) -> None:
+        now = time.monotonic()
+        if snap.mood == st.ATTENTION and self._prev_mood != st.ATTENTION:
+            self.sounds.chirp()
+            self._last_alert = now
+        elif snap.mood == st.ATTENTION and escalation_tier(snap.attention_age) >= 2:
+            if now - self._last_alert >= ALERT_REPEAT_SECS:
+                self.sounds.alert()
+                self._last_alert = now
+        elif snap.mood == st.CELEBRATE and self._prev_mood != st.CELEBRATE:
+            self.sounds.success()
+        self._prev_mood = snap.mood
 
     # ------------------------------------------------------------------
     # Input
@@ -213,11 +260,18 @@ class Display:
                 self._pointer_down = None  # consume the waking touch
                 return
             self._pointer_down = (x, y, now)
+            self._pointer_moved = 0.0
             self._drag_last_y = y
             return
 
         if is_motion and self._drag_last_y is not None:
-            if SCREENS[self.screen_index] == "feed" and snap.approval is None:
+            x0, y0, _ = self._pointer_down
+            self._pointer_moved = max(self._pointer_moved, math.hypot(x - x0, y - y0))
+            if (
+                SCREENS[self.screen_index] == "feed"
+                and not snap.approvals
+                and self.overlay is None
+            ):
                 self.feed_scroll -= y - self._drag_last_y
             self._drag_last_y = y
             return
@@ -229,23 +283,53 @@ class Display:
         self._pointer_down = None
         self._drag_last_y = None
         dx, dy = x - x0, y - y0
-
-        if snap.approval is not None:
-            if self._hit_approval_buttons(x, y):
-                return
-
         moved = math.hypot(dx, dy)
-        if moved <= max(8, self.unit * TAP_MAX_PX_FRACTION) and now - t0 <= TAP_MAX_SECS:
+        is_tap = moved <= max(8, self.unit * TAP_MAX_PX_FRACTION) and now - t0 <= TAP_MAX_SECS
+        is_swipe = abs(dx) > self.w * SWIPE_FRACTION and abs(dx) > abs(dy)
+
+        # Approval overlay eats input first.
+        if snap.approvals:
+            if is_tap and self._hit_approval_buttons(x, y):
+                return
+            if is_swipe and len(snap.approvals) > 1:
+                self.approval_index += 1 if dx < 0 else -1
+            return
+
+        if self.overlay == "settings":
+            if is_tap:
+                self._hit_settings(x, y)
+            return
+        if self.overlay == "sessions":
+            if is_tap:
+                self.overlay = None
+            return
+
+        if is_tap:
             self._on_tap(x, y, now, snap)
             return
-        if abs(dx) > self.w * SWIPE_FRACTION and abs(dx) > abs(dy) and snap.approval is None:
+        if is_swipe:
             if dx < 0:
                 self.screen_index = min(self.screen_index + 1, len(SCREENS) - 1)
             else:
                 self.screen_index = max(self.screen_index - 1, 0)
 
+    def _check_long_press(self, snap: Snapshot) -> None:
+        if self._pointer_down is None or snap.approvals or self.overlay is not None:
+            return
+        x0, y0, t0 = self._pointer_down
+        if (
+            time.monotonic() - t0 >= LONG_PRESS_SECS
+            and self._pointer_moved <= max(10, self.unit * 0.03)
+        ):
+            self._pointer_down = None
+            self._drag_last_y = None
+            self.overlay = "settings"
+
     def _on_tap(self, x: float, y: float, now: float, snap: Snapshot) -> None:
-        if SCREENS[self.screen_index] == "pet" and snap.approval is None:
+        if y <= self.header_h and snap.sessions:
+            self.overlay = "sessions"
+            return
+        if SCREENS[self.screen_index] == "pet":
             # Triple-tap easter egg: make the buddy dizzy.
             self._recent_taps = [t for t in self._recent_taps if now - t < 1.0]
             self._recent_taps.append(now)
@@ -255,13 +339,42 @@ class Display:
 
     def _hit_approval_buttons(self, x: float, y: float) -> bool:
         approve, deny = self._approval_button_rects()
+        snap = self.store.snapshot()
+        selected = None
+        if snap.approvals:
+            selected = snap.approvals[self.approval_index % len(snap.approvals)]
+        rid = selected.request_id if selected else None
         if approve.collidepoint(x, y):
-            self.store.resolve_current_approval("allow")
+            if self.store.resolve_approval("allow", rid):
+                self.sounds.success()
+            self.approval_index = 0
             return True
         if deny.collidepoint(x, y):
-            self.store.resolve_current_approval("deny")
+            if self.store.resolve_approval("deny", rid):
+                self.sounds.deny()
+            self.approval_index = 0
             return True
         return False
+
+    def _hit_settings(self, x: float, y: float) -> None:
+        for rect, action in self._settings_rects:
+            if not rect.collidepoint(x, y):
+                continue
+            if action == "sound":
+                self.sounds.toggle()
+            elif action == "grid":
+                self.grid_enabled = not self.grid_enabled
+            elif action == "dim":
+                self._last_interaction = time.monotonic() - self.config.dim_after - 10
+                self.overlay = None
+            elif action == "reset":
+                self.store.reset_stats()
+            elif action == "exit":
+                pygame.event.post(pygame.event.Event(pygame.QUIT))
+            elif action == "close":
+                self.overlay = None
+            return
+        self.overlay = None  # tap outside the panel closes
 
     def _wake(self) -> bool:
         """Register interaction; returns True if the screen was dimmed."""
@@ -274,6 +387,34 @@ class Display:
         if idle_for < self.config.dim_after:
             return 0.0
         return min(1.0, (idle_for - self.config.dim_after) / 5.0)
+
+    # ------------------------------------------------------------------
+    # Weather (optional, for the ambient clock)
+    # ------------------------------------------------------------------
+
+    def _start_weather(self) -> None:
+        lat = getattr(self.config, "latitude", None)
+        lon = getattr(self.config, "longitude", None)
+        if lat is None or lon is None:
+            return
+
+        def poll():
+            url = (
+                "https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}&current_weather=true"
+            )
+            while True:
+                try:
+                    with urllib.request.urlopen(url, timeout=10) as resp:
+                        data = json.loads(resp.read())
+                    cw = data.get("current_weather", {})
+                    if "temperature" in cw:
+                        self.weather_text = f"{round(cw['temperature'])}°"
+                except Exception as exc:  # network is best-effort
+                    log.debug("weather fetch failed: %s", exc)
+                time.sleep(1800)
+
+        threading.Thread(target=poll, name="pibuddy-weather", daemon=True).start()
 
     # ------------------------------------------------------------------
     # Drawing
@@ -290,15 +431,49 @@ class Display:
         else:
             self._draw_stats(snap)
         self._draw_screen_dots()
-        if snap.approval is not None:
+
+        if snap.approvals:
             self._draw_approval(snap)
-        else:
-            dim = self._dim_level()
-            if dim > 0 and snap.mood in (st.SLEEP, st.IDLE):
-                veil = pygame.Surface((self.w, self.h))
-                veil.fill((0, 0, 0))
-                veil.set_alpha(int(210 * dim))
-                self.canvas.blit(veil, (0, 0))
+            self._draw_escalation_edge(snap)
+            return
+        if self.overlay == "settings":
+            self._draw_settings()
+            return
+        if self.overlay == "sessions":
+            self._draw_sessions(snap)
+            return
+
+        if snap.mood == st.ATTENTION:
+            self._draw_escalation_edge(snap)
+            return  # never dim while attention is needed
+        dim = self._dim_level()
+        if dim > 0 and snap.mood in (st.SLEEP, st.IDLE):
+            veil = pygame.Surface((self.w, self.h))
+            veil.fill((0, 0, 0))
+            veil.set_alpha(int(225 * dim))
+            self.canvas.blit(veil, (0, 0))
+            if dim >= 1.0 and snap.mood == st.SLEEP:
+                self._draw_clock()
+
+    def _draw_escalation_edge(self, snap: Snapshot) -> None:
+        tier = escalation_tier(snap.attention_age)
+        if tier == 0:
+            return
+        t = time.monotonic() - self._started
+        pulse = (math.sin(t * (4 if tier == 1 else 8)) + 1) / 2
+        color = ATTN if tier == 1 else URGENT
+        thickness = max(4, int(self.unit * 0.02))
+        edge = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        alpha = int(90 + 140 * pulse)
+        for i in range(thickness):
+            fade = 1.0 - i / thickness
+            pygame.draw.rect(
+                edge,
+                (*color, int(alpha * fade)),
+                pygame.Rect(i, i, self.w - 2 * i, self.h - 2 * i),
+                width=1,
+            )
+        self.canvas.blit(edge, (0, 0))
 
     def _draw_header(self, snap: Snapshot) -> None:
         pygame.draw.rect(self.canvas, BG_PANEL, (0, 0, self.w, self.header_h))
@@ -307,39 +482,68 @@ class Display:
         self.canvas.blit(
             title, (int(self.unit * 0.03), (self.header_h - title.get_height()) // 2)
         )
-        # One dot per session, colored by its state.
+        # One dot per session, colored by its state (tap for details).
         r = max(4, int(self.header_h * 0.16))
         x = self.w - int(self.unit * 0.03) - r
         now = time.monotonic()
         for sess in snap.sessions[:10]:
-            if sess.needs_attention:
-                color = ATTN
-            elif now < sess.busy_until:
-                color = (120, 180, 240)
-            else:
-                color = MUTED
+            mood = session_mood(sess, now)
+            color = ATTN if mood == st.ATTENTION else (120, 180, 240) if mood == st.BUSY else MUTED
             pygame.draw.circle(self.canvas, color, (x, self.header_h // 2), r)
             x -= r * 3
 
     def _draw_pet(self, snap: Snapshot) -> None:
         t = time.monotonic() - self._started
+        if self.grid_enabled and len(snap.sessions) >= 2 and not self.pack:
+            self._draw_buddy_grid(snap, t)
+            return
+        intensity = 1.0 + 0.6 * escalation_tier(snap.attention_age)
         if self.pack:
             self.pack.draw(self.canvas, self.stage, snap.mood, t)
         else:
-            vector_buddy.draw(self.canvas, self.stage, snap.mood, t)
+            vector_buddy.draw(
+                self.canvas, self.stage, snap.mood, t, intensity=intensity, level=snap.level
+            )
 
         caption = MOOD_CAPTIONS.get(snap.mood, "")
         n = len(snap.sessions)
         if n and snap.mood in (st.IDLE, st.BUSY):
             caption = f"{n} session{'s' if n != 1 else ''} · {caption}"
-        if snap.approvals_waiting > 1:
-            caption = f"{snap.approvals_waiting} approvals waiting"
+        if snap.mood == st.ATTENTION and escalation_tier(snap.attention_age) >= 1:
+            caption = f"waiting {int(snap.attention_age)}s — hello?!"
         f = self.font(int(self.unit * 0.06))
         text = f.render(caption, True, MUTED)
         self.canvas.blit(
             text,
             (self.w // 2 - text.get_width() // 2, self.stage.bottom - text.get_height()),
         )
+
+    def _draw_buddy_grid(self, snap: Snapshot, t: float) -> None:
+        """One mini-Clawd per session."""
+        sessions = snap.sessions[:9]
+        n = len(sessions)
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        cell_w = self.stage.width // cols
+        cell_h = self.stage.height // rows
+        now = time.monotonic()
+        f = self.font(max(12, int(min(cell_w, cell_h) * 0.09)))
+        for i, sess in enumerate(sessions):
+            cell = pygame.Rect(
+                self.stage.left + (i % cols) * cell_w,
+                self.stage.top + (i // cols) * cell_h,
+                cell_w,
+                cell_h,
+            )
+            mood = session_mood(sess, now)
+            # Stagger each buddy's animation so they don't move in lockstep.
+            vector_buddy.draw(self.canvas, cell.inflate(-8, -f.get_height() * 2), mood,
+                              t + i * 1.7, level=snap.level)
+            name = sess.cwd.rstrip("/").rsplit("/", 1)[-1] or sess.session_id[:8]
+            label = f.render(name, True, FG if mood != st.IDLE else MUTED)
+            self.canvas.blit(
+                label, (cell.centerx - label.get_width() // 2, cell.bottom - label.get_height() - 2)
+            )
 
     def _draw_feed(self, snap: Snapshot) -> None:
         row_h = max(24, int(self.unit * 0.085))
@@ -385,44 +589,94 @@ class Display:
 
     def _draw_stats(self, snap: Snapshot) -> None:
         pad = int(self.unit * 0.06)
-        f_big = self.font(int(self.unit * 0.14))
-        f = self.font(int(self.unit * 0.06))
-        y = self.stage.top + pad
+        f_big = self.font(int(self.unit * 0.12))
+        f = self.font(int(self.unit * 0.055))
+        y = self.stage.top + pad // 2
 
         level = f_big.render(f"Level {snap.level}", True, ACCENT)
         self.canvas.blit(level, (pad, y))
-        y += level.get_height() + pad // 2
+        streak = f.render(
+            f"{snap.streak_days} day streak" if snap.streak_days else "", True, GOOD
+        )
+        self.canvas.blit(streak, (pad + level.get_width() + pad, y + level.get_height() // 3))
+        y += level.get_height() + pad // 3
 
         # XP progress bar toward the next level.
         into = snap.xp % st.XP_PER_LEVEL
-        bar = pygame.Rect(pad, y, self.w - pad * 2, max(10, int(self.unit * 0.04)))
+        bar = pygame.Rect(pad, y, self.w - pad * 2, max(10, int(self.unit * 0.035)))
         pygame.draw.rect(self.canvas, BG_PANEL, bar, border_radius=bar.height // 2)
         fill = bar.copy()
         fill.width = max(bar.height, int(bar.width * into / st.XP_PER_LEVEL))
         pygame.draw.rect(self.canvas, ACCENT, fill, border_radius=bar.height // 2)
         y += bar.height + pad // 2
-        xp_label = f.render(f"{into} / {st.XP_PER_LEVEL} xp", True, MUTED)
-        self.canvas.blit(xp_label, (pad, y))
-        y += xp_label.get_height() + pad
 
-        uptime = int(time.monotonic() - self._started)
+        today = snap.today
         lines = [
-            f"Sessions: {len(snap.sessions)}",
-            f"Events seen: {snap.events_seen}",
-            f"Uptime: {uptime // 3600}h {(uptime % 3600) // 60}m",
-            f"Character: {self.pack.name if self.pack else 'Pip (built-in)'}",
-            "",
-            "Send hooks to:",
-        ]
-        lines += [
-            f"  http://{addr}:{self.config.port}" for addr in _local_addresses()
+            f"Today: {today.tools} tools · {today.prompts} prompts · {today.stops} tasks done",
+            f"Sessions: {len(snap.sessions)} live · {today.sessions} today · {snap.events_seen} events",
+            f"Character: {self.pack.name if self.pack else 'Clawd (built-in)'}",
         ]
         for line in lines:
-            if y > self.stage.bottom - f.get_height():
-                break
-            label = f.render(line, True, FG if not line.startswith("  ") else GOOD)
+            label = f.render(line, True, FG)
+            self.canvas.blit(label, (pad, y))
+            y += int(f.get_height() * 1.3)
+
+        # Busiest-hours mini chart.
+        peak = max(snap.hour_hist) or 1
+        chart_h = max(16, int(self.unit * 0.1))
+        chart_w = min(self.w - pad * 2, int(self.w * 0.55))
+        bw = chart_w // 24
+        base = y + chart_h
+        for hour, count in enumerate(snap.hour_hist):
+            hgt = max(2, int(chart_h * count / peak)) if count else 2
+            color = ACCENT if count == peak and count else (90, 88, 105)
+            pygame.draw.rect(
+                self.canvas, color, (pad + hour * bw, base - hgt, max(2, bw - 2), hgt)
+            )
+        y = base + int(f.get_height() * 0.5)
+        cap = f.render("activity by hour", True, MUTED)
+        self.canvas.blit(cap, (pad, y))
+        y += int(f.get_height() * 1.5)
+
+        addr = _local_addresses()
+        url = f"http://{addr[0]}:{self.config.port}" if addr else ""
+        for line in ("Pair a laptop / open phone remote:", f"  {url}"):
+            label = f.render(line, True, GOOD if line.startswith("  ") else FG)
             self.canvas.blit(label, (pad, y))
             y += int(f.get_height() * 1.25)
+
+        # QR code for the phone page, right-hand side if it fits.
+        if url:
+            self._blit_qr(url, pad)
+
+    def _blit_qr(self, url: str, pad: int) -> None:
+        target = url
+        token = getattr(self.config, "token", "")
+        if token:
+            target = f"{url}/?token={token}"
+        if self._qr_cache is None or self._qr_cache[0] != target:
+            matrix = _make_qr(target)
+            if matrix is None:
+                return
+            n = len(matrix)
+            scale = max(2, int(self.unit * 0.35) // n)
+            quiet = scale * 2
+            size = n * scale + quiet * 2
+            surf = pygame.Surface((size, size))
+            surf.fill(FG)
+            for r, row in enumerate(matrix):
+                for c, val in enumerate(row):
+                    if val:
+                        pygame.draw.rect(
+                            surf, (0, 0, 0),
+                            (quiet + c * scale, quiet + r * scale, scale, scale),
+                        )
+            self._qr_cache = (target, surf)
+        surf = self._qr_cache[1]
+        x = self.w - surf.get_width() - pad
+        y = self.stage.bottom - surf.get_height() - pad // 2
+        if x > self.w * 0.55:  # only when there's room next to the text
+            self.canvas.blit(surf, (x, y))
 
     def _draw_screen_dots(self) -> None:
         r = max(3, int(self.unit * 0.012))
@@ -433,6 +687,105 @@ class Display:
         for i in range(len(SCREENS)):
             color = FG if i == self.screen_index else (90, 88, 105)
             pygame.draw.circle(self.canvas, color, (x + i * gap, cy), r)
+
+    # ------------------------------------------------------------------
+    # Ambient clock (sleep + fully dimmed)
+    # ------------------------------------------------------------------
+
+    def _draw_clock(self) -> None:
+        now = datetime.datetime.now()
+        f_time = self.font(int(self.unit * 0.28))
+        f_date = self.font(int(self.unit * 0.07))
+        dim_fg = (110, 108, 125)
+        clock = f_time.render(now.strftime("%H:%M"), True, dim_fg)
+        self.canvas.blit(clock, clock.get_rect(center=(self.w // 2, int(self.h * 0.42))))
+        date_line = now.strftime("%A %d %B")
+        if self.weather_text:
+            date_line += f"  ·  {self.weather_text}"
+        date = f_date.render(date_line, True, (80, 78, 92))
+        self.canvas.blit(date, date.get_rect(center=(self.w // 2, int(self.h * 0.62))))
+
+    # ------------------------------------------------------------------
+    # Sessions overlay
+    # ------------------------------------------------------------------
+
+    def _draw_sessions(self, snap: Snapshot) -> None:
+        veil = pygame.Surface((self.w, self.h))
+        veil.fill((10, 8, 14))
+        veil.set_alpha(210)
+        self.canvas.blit(veil, (0, 0))
+
+        pad = int(self.unit * 0.05)
+        f_head = self.font(int(self.unit * 0.07))
+        f = self.font(int(self.unit * 0.05))
+        f_small = self.font(int(self.unit * 0.042))
+        y = pad
+        head = f_head.render(f"{len(snap.sessions)} active session(s)", True, FG)
+        self.canvas.blit(head, (pad, y))
+        y += head.get_height() + pad
+
+        now = time.monotonic()
+        card_h = int(f.get_height() * 1.4 + f_small.get_height() * 2.6)
+        for sess in snap.sessions[:6]:
+            mood = session_mood(sess, now)
+            color = ATTN if mood == st.ATTENTION else (120, 180, 240) if mood == st.BUSY else MUTED
+            card = pygame.Rect(pad, y, self.w - pad * 2, card_h)
+            pygame.draw.rect(self.canvas, BG_PANEL, card, border_radius=pad // 2)
+            pygame.draw.circle(
+                self.canvas, color, (card.left + pad, card.top + card_h // 2), max(5, int(self.unit * 0.015))
+            )
+            tx = card.left + pad * 2
+            name = sess.cwd or sess.session_id
+            mins = int((now - sess.started) / 60) if sess.started else 0
+            self.canvas.blit(
+                f.render(f"{name}   ·   {mood} · {mins}m", True, FG), (tx, card.top + int(f.get_height() * 0.3))
+            )
+            detail = []
+            if sess.last_tool:
+                detail.append(f"last tool: {sess.last_tool}")
+            if sess.last_prompt:
+                detail.append(f'"{sess.last_prompt[:80]}"')
+            self.canvas.blit(
+                f_small.render("   ".join(detail), True, MUTED),
+                (tx, card.top + int(f.get_height() * 1.5)),
+            )
+            y += card_h + pad // 2
+        hint = f_small.render("tap anywhere to close", True, MUTED)
+        self.canvas.blit(hint, hint.get_rect(center=(self.w // 2, self.h - pad)))
+
+    # ------------------------------------------------------------------
+    # Settings overlay (long-press)
+    # ------------------------------------------------------------------
+
+    def _draw_settings(self) -> None:
+        veil = pygame.Surface((self.w, self.h))
+        veil.fill((10, 8, 14))
+        veil.set_alpha(210)
+        self.canvas.blit(veil, (0, 0))
+
+        pad = int(self.unit * 0.05)
+        items = [
+            ("sound", f"Sound: {'on' if self.sounds.enabled else 'off'}"),
+            ("grid", f"Buddy grid: {'on' if self.grid_enabled else 'off'}"),
+            ("dim", "Dim screen now"),
+            ("reset", "Reset stats"),
+            ("exit", "Exit PiBuddy"),
+            ("close", "Close menu"),
+        ]
+        btn_h = max(44, int((self.h - pad * (len(items) + 1)) / len(items)))
+        btn_w = min(self.w - pad * 2, int(self.unit * 1.4))
+        x = self.w // 2 - btn_w // 2
+        y = pad
+        f = self.font(int(btn_h * 0.45))
+        self._settings_rects = []
+        for action, label in items:
+            rect = pygame.Rect(x, y, btn_w, btn_h)
+            color = BAD if action == "exit" else BG_PANEL
+            pygame.draw.rect(self.canvas, color, rect, border_radius=btn_h // 5)
+            text = f.render(label, True, FG)
+            self.canvas.blit(text, text.get_rect(center=rect.center))
+            self._settings_rects.append((rect, action))
+            y += btn_h + pad // 2
 
     # ------------------------------------------------------------------
     # Approval overlay
@@ -453,14 +806,18 @@ class Display:
         veil.set_alpha(235)
         self.canvas.blit(veil, (0, 0))
 
-        req = snap.approval
+        total = len(snap.approvals)
+        req = snap.approvals[self.approval_index % total]
         pad = int(self.unit * 0.05)
         f_small = self.font(int(self.unit * 0.055))
         f_tool = self.font(int(self.unit * 0.1))
         f_detail = self.font(int(self.unit * 0.06))
 
         y = pad
-        head = f_small.render("Claude wants to use:", True, ATTN)
+        heading = "Claude wants to use:"
+        if total > 1:
+            heading = f"Claude wants to use:   ({self.approval_index % total + 1} of {total} — swipe)"
+        head = f_small.render(heading, True, ATTN)
         self.canvas.blit(head, (pad, y))
         y += head.get_height() + pad // 2
 

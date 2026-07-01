@@ -11,6 +11,7 @@ Mood priority (highest wins):
 
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 import uuid
@@ -38,11 +39,24 @@ DIZZY_SECS = 3.0
 # Approvals answered faster than this trigger the heart animation.
 FAST_APPROVAL_SECS = 5.0
 
+# Attention escalation tiers (seconds unanswered -> tier 0/1/2).
+ESCALATE_T1 = 30.0
+ESCALATE_T2 = 60.0
+
 XP_PER_TOOL = 5
 XP_PER_STOP = 50
 XP_PER_LEVEL = 1000
 
 _WORKING_EVENTS = {"UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"}
+
+
+def escalation_tier(attention_age: float) -> int:
+    """0 = normal, 1 = getting impatient, 2 = jumping up and down."""
+    if attention_age >= ESCALATE_T2:
+        return 2
+    if attention_age >= ESCALATE_T1:
+        return 1
+    return 0
 
 
 @dataclass
@@ -52,7 +66,19 @@ class Session:
     last_seen: float = 0.0
     busy_until: float = 0.0
     needs_attention: bool = False
+    attention_since: float = 0.0
     last_tool: str = ""
+    last_prompt: str = ""
+    started: float = 0.0
+
+
+def session_mood(sess: Session, now: float) -> str:
+    """The mood of a single session (used by the buddy-grid view)."""
+    if sess.needs_attention:
+        return ATTENTION
+    if now < sess.busy_until:
+        return BUSY
+    return IDLE
 
 
 @dataclass
@@ -77,19 +103,36 @@ class LogEntry:
 
 
 @dataclass
+class DayStats:
+    tools: int = 0
+    prompts: int = 0
+    stops: int = 0
+    sessions: int = 0
+    xp: int = 0
+
+
+@dataclass
 class Snapshot:
     """Immutable view of state for one render frame."""
 
     mood: str
     sessions: list[Session]
-    approval: Approval | None
+    approvals: list[Approval]  # pending, oldest first
     approvals_waiting: int
+    attention_age: float  # seconds the oldest attention has gone unanswered
     xp: int
     level: int
     events_seen: int
     last_event_name: str
     last_event_at: float
     log: list[LogEntry]
+    today: DayStats
+    streak_days: int
+    hour_hist: list[int]  # tool events per hour-of-day, all time
+
+    @property
+    def approval(self) -> Approval | None:
+        return self.approvals[0] if self.approvals else None
 
 
 class StateStore:
@@ -108,6 +151,9 @@ class StateStore:
         self._celebrate_until = 0.0
         self._heart_until = 0.0
         self._dizzy_until = 0.0
+        self._daily: dict[str, DayStats] = {}  # ISO date -> stats
+        self._hour_hist = [0] * 24
+        self.dirty = False  # set on changes worth persisting
 
     # ------------------------------------------------------------------
     # Event ingestion (called from the server thread)
@@ -129,36 +175,45 @@ class StateStore:
                 self._expire(now)
                 return
 
-            sess = self._sessions.setdefault(sid, Session(session_id=sid))
+            sess = self._sessions.setdefault(sid, Session(session_id=sid, started=now))
             sess.last_seen = now
             if payload.get("cwd"):
                 sess.cwd = str(payload["cwd"])
 
             if name in _WORKING_EVENTS:
                 sess.busy_until = now + BUSY_LINGER
-                sess.needs_attention = False
+                self._clear_attention(sess)
+                if name == "UserPromptSubmit":
+                    sess.last_prompt = str(payload.get("prompt", ""))[:200]
                 if name in ("PreToolUse", "PostToolUse"):
                     sess.last_tool = str(payload.get("tool_name", ""))
                     self._add_xp(XP_PER_TOOL, now)
+                    self._today().tools += 1
+                    self._hour_hist[datetime.datetime.now().hour] += 1
+                if name == "UserPromptSubmit":
+                    self._today().prompts += 1
             elif name == "Notification":
                 message = str(payload.get("message", "")).lower()
                 if "permission" in message or "waiting" in message:
-                    sess.needs_attention = True
+                    self._raise_attention(sess, now)
                     sess.busy_until = 0.0
             elif name in ("Stop", "SubagentStop"):
                 sess.busy_until = 0.0
-                sess.needs_attention = False
+                self._clear_attention(sess)
                 if name == "Stop":
                     self._celebrate_until = now + CELEBRATE_SECS
                     self._add_xp(XP_PER_STOP, now)
+                    self._today().stops += 1
             elif name == "SessionStart":
                 sess.busy_until = now + BUSY_LINGER
+                self._today().sessions += 1
 
             # Hook scripts may attach token usage they extracted client-side.
             tokens = payload.get("pibuddy_tokens")
             if isinstance(tokens, (int, float)) and tokens > 0:
                 self._add_xp(int(tokens) // 100, now)
 
+            self.dirty = True
             self._expire(now)
 
     # ------------------------------------------------------------------
@@ -187,27 +242,38 @@ class StateStore:
             self._approvals.append(req)
         return req
 
-    def resolve_current_approval(self, decision: str) -> Approval | None:
-        """Called from the UI thread when the user taps approve/deny."""
+    def resolve_approval(self, decision: str, request_id: str | None = None) -> Approval | None:
+        """Resolve a pending approval (the oldest one if no id is given).
+
+        Called from the UI thread (touch) or the server (phone page).
+        """
         now = self._clock()
         with self._lock:
             for req in self._approvals:
-                if req.decision is None:
-                    req.decision = decision
-                    req.decided_at = now
-                    if decision == "allow" and now - req.created <= FAST_APPROVAL_SECS:
-                        self._heart_until = now + HEART_SECS
-                    verdict = "approved" if decision == "allow" else "denied"
-                    self._log.appendleft(
-                        LogEntry(
-                            when=time.time(),
-                            session_id=req.session_id,
-                            kind="approval",
-                            text=f"{verdict}: {req.tool_name}  {req.detail}"[:300],
-                        )
+                if req.decision is not None:
+                    continue
+                if request_id is not None and req.request_id != request_id:
+                    continue
+                req.decision = decision
+                req.decided_at = now
+                if decision == "allow" and now - req.created <= FAST_APPROVAL_SECS:
+                    self._heart_until = now + HEART_SECS
+                verdict = "approved" if decision == "allow" else "denied"
+                self._log.appendleft(
+                    LogEntry(
+                        when=time.time(),
+                        session_id=req.session_id,
+                        kind="approval",
+                        text=f"{verdict}: {req.tool_name}  {req.detail}"[:300],
                     )
-                    return req
+                )
+                self.dirty = True
+                return req
         return None
+
+    # Backwards-compatible alias.
+    def resolve_current_approval(self, decision: str) -> Approval | None:
+        return self.resolve_approval(decision)
 
     def discard_approval(self, req: Approval) -> None:
         with self._lock:
@@ -222,6 +288,50 @@ class StateStore:
         with self._lock:
             self._dizzy_until = self._clock() + DIZZY_SECS
 
+    def reset_stats(self) -> None:
+        with self._lock:
+            self.xp = 0
+            self._daily.clear()
+            self._hour_hist = [0] * 24
+            self.dirty = True
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def export_state(self) -> dict:
+        with self._lock:
+            self.dirty = False
+            return {
+                "xp": self.xp,
+                "hour_hist": list(self._hour_hist),
+                "daily": {day: vars(stats) for day, stats in self._daily.items()},
+            }
+
+    def import_state(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+
+        def as_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        with self._lock:
+            self.xp = as_int(data.get("xp"))
+            hist = data.get("hour_hist")
+            if isinstance(hist, list) and len(hist) == 24:
+                self._hour_hist = [as_int(v) for v in hist]
+            daily = data.get("daily")
+            if isinstance(daily, dict):
+                known = set(vars(DayStats()).keys())
+                for day, stats in daily.items():
+                    if isinstance(stats, dict):
+                        self._daily[str(day)] = DayStats(
+                            **{k: as_int(v) for k, v in stats.items() if k in known}
+                        )
+
     # ------------------------------------------------------------------
     # Reading
     # ------------------------------------------------------------------
@@ -232,19 +342,27 @@ class StateStore:
             self._expire(now)
             pending = [a for a in self._approvals if a.decision is None]
             mood = self._mood(now, bool(pending))
+            attention_age = 0.0
+            if pending:
+                attention_age = max(attention_age, now - pending[0].created)
+            for s in self._sessions.values():
+                if s.needs_attention and s.attention_since:
+                    attention_age = max(attention_age, now - s.attention_since)
             return Snapshot(
                 mood=mood,
-                sessions=[
-                    Session(**vars(s)) for s in self._sessions.values()
-                ],
-                approval=pending[0] if pending else None,
+                sessions=[Session(**vars(s)) for s in self._sessions.values()],
+                approvals=[Approval(**vars(a)) for a in pending],
                 approvals_waiting=len(pending),
+                attention_age=attention_age,
                 xp=self.xp,
                 level=self.level,
                 events_seen=self.events_seen,
                 last_event_name=self.last_event_name,
                 last_event_at=self.last_event_at,
                 log=list(self._log),
+                today=DayStats(**vars(self._today())),
+                streak_days=self._streak(),
+                hour_hist=list(self._hour_hist),
             )
 
     @property
@@ -269,6 +387,36 @@ class StateStore:
         if self._sessions:
             return IDLE
         return SLEEP
+
+    def _raise_attention(self, sess: Session, now: float) -> None:
+        if not sess.needs_attention:
+            sess.needs_attention = True
+            sess.attention_since = now
+
+    def _clear_attention(self, sess: Session) -> None:
+        sess.needs_attention = False
+        sess.attention_since = 0.0
+
+    def _today(self) -> DayStats:
+        key = datetime.date.today().isoformat()
+        if key not in self._daily:
+            self._daily[key] = DayStats()
+        return self._daily[key]
+
+    def _streak(self) -> int:
+        """Consecutive days with any activity, ending today or yesterday."""
+        day = datetime.date.today()
+        streak = 0
+        stats = self._daily.get(day.isoformat())
+        if not stats or (stats.tools + stats.prompts + stats.stops + stats.sessions) == 0:
+            day -= datetime.timedelta(days=1)  # today hasn't started yet
+        while True:
+            stats = self._daily.get(day.isoformat())
+            if not stats or (stats.tools + stats.prompts + stats.stops + stats.sessions) == 0:
+                break
+            streak += 1
+            day -= datetime.timedelta(days=1)
+        return streak
 
     def _record(self, name: str, sid: str, payload: dict[str, Any]) -> None:
         kind, text = "note", name
@@ -305,6 +453,7 @@ class StateStore:
     def _add_xp(self, amount: int, now: float) -> None:
         before = self.level
         self.xp += amount
+        self._today().xp += amount
         if self.level > before:
             self._celebrate_until = now + CELEBRATE_SECS * 2
 
