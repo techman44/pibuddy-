@@ -82,15 +82,38 @@ class BlePeripheral:
 
     def _on_notify_toggle(self, notifying, characteristic) -> None:
         self._tx = characteristic if notifying else None
+        # A new (or gone) central: drop any partial line from the old link
+        # so its bytes can't corrupt the first message of the next one.
+        self.handler.reset()
         log.info("BLE: central %s notifications", "enabled" if notifying else "disabled")
 
     def _send_line(self, line: bytes) -> None:
+        """Emit one reply line as TX notifications.
+
+        Called from approval-waiter threads, but dbus-python is not
+        thread-safe without explicit init, so the actual set_value calls
+        are marshalled onto the GLib main loop (which device.publish()
+        runs in the BLE thread). Sending a whole line per idle callback
+        also keeps concurrent replies from interleaving chunks.
+        """
         tx = self._tx
         if tx is None:
             log.info("BLE: no subscribed central, dropping reply")
             return
-        # The peripheral can't see the negotiated MTU through bluezero, so
-        # notify in 20-byte pieces — the minimum every stack accepts; the
-        # bridge reassembles by newline.
-        for piece in chunks(line, MIN_CHUNK_SIZE):
-            tx.set_value(list(piece))
+        # 20-byte pieces: bluezero can't see the negotiated MTU, and the
+        # BLE minimum is accepted everywhere; the bridge reassembles.
+        pieces = [list(piece) for piece in chunks(line, MIN_CHUNK_SIZE)]
+
+        def emit():
+            current = self._tx
+            if current is not None:
+                for piece in pieces:
+                    current.set_value(piece)
+            return False  # one-shot idle callback
+
+        try:
+            from gi.repository import GLib
+
+            GLib.idle_add(emit)
+        except ImportError:  # not on a GLib system (e.g. tests)
+            emit()

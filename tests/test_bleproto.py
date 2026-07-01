@@ -9,12 +9,15 @@ import time
 import pytest
 
 from pibuddy import state as st
+import threading
+
 from pibuddy.bleproto import (
     CentralCore,
     LineBuffer,
     MIN_CHUNK_SIZE,
     PeripheralHandler,
     chunks,
+    clamp_wait,
     encode,
     parse,
     safe_chunk_size,
@@ -159,6 +162,82 @@ async def test_central_timeout_returns_none():
     decision = await core.request_approval({"tool_name": "Bash"}, wait=0.1, loop=loop)
     assert decision == "none"
     assert loop.time() - t0 < 12  # bounded, not hanging
+
+
+def test_clamp_wait():
+    assert clamp_wait(45) == 45.0
+    assert clamp_wait("30") == 30.0
+    assert clamp_wait(600) == 120.0  # server-side maximum
+    assert clamp_wait(0) == 1.0
+    assert clamp_wait("nan") == 45.0  # garbage -> default, never nan
+    assert clamp_wait(float("inf")) == 45.0
+    assert clamp_wait(None) == 45.0
+    assert clamp_wait("bogus") == 45.0
+
+
+def test_buffers_reset_on_reconnect():
+    # Peripheral side: a partial line from a dropped link must not
+    # corrupt the first message of the next connection.
+    store = StateStore()
+    handler = PeripheralHandler(store, lambda line: None)
+    handler.receive(b'{"kind":"event","payl')  # link dies mid-frame
+    handler.reset()
+    handler.receive(encode({"kind": "event", "payload": {
+        "hook_event_name": "UserPromptSubmit", "session_id": "s"}}))
+    assert store.snapshot().mood == st.BUSY
+
+    # Central side: same story for notifications.
+    core = CentralCore(send_line=lambda line: None)
+    core.feed(b'{"kind":"deci')
+    core.reset()
+    got = []
+    core._pending["a1"] = _FakeFuture(got)
+    core.feed(encode({"kind": "decision", "id": "a1", "decision": "allow"}))
+    assert got == ["allow"]
+
+
+class _FakeFuture:
+    def __init__(self, sink):
+        self._sink = sink
+        self._done = False
+
+    def done(self):
+        return self._done
+
+    def set_result(self, value):
+        self._done = True
+        self._sink.append(value)
+
+
+@pytest.mark.asyncio
+async def test_fail_pending_unblocks_approvals_on_disconnect():
+    core = CentralCore(send_line=lambda line: None)  # decision never arrives
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(
+        core.request_approval({"tool_name": "Bash"}, wait=60, loop=loop)
+    )
+    await asyncio.sleep(0.05)
+    assert core._pending  # in flight
+    core.fail_pending()  # BLE dropped
+    decision = await asyncio.wait_for(task, timeout=1)
+    assert decision == "none"  # answered immediately, not after 60s
+
+
+def test_approval_slots_bounded():
+    store = StateStore()
+    replies = []
+    handler = PeripheralHandler(store, replies.append)
+    handler._approval_slots = threading.Semaphore(1)
+    handler.receive(encode({"kind": "approval", "id": "one", "wait": 5,
+                            "payload": {"session_id": "s", "tool_name": "Bash"}}))
+    # Slot occupied: the second request is refused immediately.
+    handler.receive(encode({"kind": "approval", "id": "two", "wait": 5,
+                            "payload": {"session_id": "s", "tool_name": "Write"}}))
+    deadline = time.monotonic() + 2
+    while not replies and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert parse(replies[0][:-1]) == {"kind": "decision", "id": "two", "decision": "none"}
+    store.resolve_approval("deny")  # release the waiter thread
 
 
 def test_safe_chunk_size_clamps():

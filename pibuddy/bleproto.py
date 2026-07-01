@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from typing import Any, Callable, Iterator
@@ -42,6 +43,24 @@ MIN_CHUNK_SIZE = 20
 MAX_LINE = 64 * 1024  # drop anything absurd rather than buffer forever
 MAX_APPROVAL_WAIT = 120.0
 DEFAULT_APPROVAL_WAIT = 45.0
+# How many approval requests a peripheral will hold concurrently.
+MAX_PENDING_APPROVALS = 16
+
+
+def clamp_wait(value: object) -> float:
+    """Parse an approval wait into [1, MAX_APPROVAL_WAIT] seconds.
+
+    Garbage, nan and inf all fall back to the default — every layer
+    (HTTP server, BLE peripheral, laptop bridge) must agree on this so
+    timeout budgets stay consistent end to end.
+    """
+    try:
+        wait = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_APPROVAL_WAIT
+    if not math.isfinite(wait):
+        return DEFAULT_APPROVAL_WAIT
+    return max(1.0, min(wait, MAX_APPROVAL_WAIT))
 
 
 def encode(message: dict) -> bytes:
@@ -108,6 +127,11 @@ class PeripheralHandler:
         self.store = store
         self.send_line = send_line
         self._buffer = LineBuffer()
+        self._approval_slots = threading.Semaphore(MAX_PENDING_APPROVALS)
+
+    def reset(self) -> None:
+        """Drop any partial line left over from a previous connection."""
+        self._buffer = LineBuffer()
 
     def receive(self, data: bytes) -> None:
         for line in self._buffer.feed(data):
@@ -135,11 +159,13 @@ class PeripheralHandler:
         if not isinstance(payload, dict):
             return
         request_id = str(msg.get("id") or "")
-        try:
-            wait = float(msg.get("wait", DEFAULT_APPROVAL_WAIT))
-        except (TypeError, ValueError):
-            wait = DEFAULT_APPROVAL_WAIT
-        wait = max(1.0, min(wait, MAX_APPROVAL_WAIT))
+        wait = clamp_wait(msg.get("wait"))
+
+        # Bound the number of waiter threads a central can pile up.
+        if not self._approval_slots.acquire(blocking=False):
+            log.warning("too many pending approvals, refusing %s", request_id)
+            self._reply({"kind": "decision", "id": request_id, "decision": "none"})
+            return
 
         self.store.apply_event({**payload, "hook_event_name": "PreToolUse"})
         req = self.store.add_approval(payload)
@@ -151,6 +177,7 @@ class PeripheralHandler:
                     time.sleep(0.1)
             finally:
                 self.store.discard_approval(req)
+                self._approval_slots.release()
             self._reply(
                 {"kind": "decision", "id": request_id, "decision": req.decision or "none"}
             )
@@ -199,19 +226,34 @@ class CentralCore:
         self._counter += 1
         return f"a{self._counter}"
 
+    def reset(self) -> None:
+        """Call on (re)connect: drop any partial line from the old link."""
+        self._buffer = LineBuffer()
+
+    def fail_pending(self) -> None:
+        """Call on disconnect: answer every in-flight approval with 'none'
+        immediately instead of holding the hook until its timeout."""
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_result("none")
+        self._pending.clear()
+
     async def send_event(self, payload: dict) -> None:
         await self._send({"kind": "event", "payload": payload})
 
     async def request_approval(self, payload: dict, wait: float, loop) -> str:
         import asyncio
 
+        wait = clamp_wait(wait)
         rid = self.next_id()
         future = loop.create_future()
         self._pending[rid] = future
         try:
             await self._send({"kind": "approval", "id": rid, "wait": wait, "payload": payload})
+            # Grace must stay under the hook's curl --max-time (wait + 5),
+            # or our answer would be written to a closed socket.
             try:
-                return await asyncio.wait_for(future, timeout=wait + 10)
+                return await asyncio.wait_for(future, timeout=wait + 3)
             except asyncio.TimeoutError:
                 return "none"
         finally:

@@ -33,7 +33,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aiohttp import web  # noqa: E402
 
-from pibuddy.bleproto import CentralCore, MIN_CHUNK_SIZE, chunks, safe_chunk_size  # noqa: E402
+from pibuddy.bleproto import (  # noqa: E402
+    CentralCore,
+    MIN_CHUNK_SIZE,
+    chunks,
+    clamp_wait,
+    safe_chunk_size,
+)
 from pibuddy.ble import UART_RX, UART_SERVICE, UART_TX  # noqa: E402
 
 log = logging.getLogger("pibuddy.bridge")
@@ -95,6 +101,7 @@ class Bridge:
                     self.client = client
                     self._chunk_size = self._negotiated_chunk_size(client)
                     log.info("BLE write chunk size: %d bytes", self._chunk_size)
+                    self.core.reset()  # drop partial lines from the old link
                     await client.start_notify(
                         UART_TX, lambda _, data: self.core.feed(bytes(data))
                     )
@@ -107,6 +114,8 @@ class Bridge:
             finally:
                 self.core.connected = False
                 self.client = None
+                # Don't hold hooks for answers that can no longer arrive.
+                self.core.fail_pending()
             await asyncio.sleep(RECONNECT_DELAY)
 
     # --------------------------------------------------------- HTTP side
@@ -138,10 +147,7 @@ class Bridge:
         @routes.post("/api/approval")
         async def approval(request: web.Request) -> web.Response:
             payload = await read_json(request)
-            try:
-                wait = float(request.query.get("wait", 45))
-            except ValueError:
-                wait = 45.0
+            wait = clamp_wait(request.query.get("wait"))
             if not self.core.connected:
                 return web.json_response({"decision": "none", "reason": "ble disconnected"})
             try:
