@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from .bleproto import PeripheralHandler, chunks
+from .bleproto import MIN_CHUNK_SIZE, PeripheralHandler, chunks
 from .state import StateStore
 
 log = logging.getLogger("pibuddy.ble")
@@ -89,5 +89,8 @@ class BlePeripheral:
         if tx is None:
             log.info("BLE: no subscribed central, dropping reply")
             return
-        for piece in chunks(line):
+        # The peripheral can't see the negotiated MTU through bluezero, so
+        # notify in 20-byte pieces — the minimum every stack accepts; the
+        # bridge reassembles by newline.
+        for piece in chunks(line, MIN_CHUNK_SIZE):
             tx.set_value(list(piece))

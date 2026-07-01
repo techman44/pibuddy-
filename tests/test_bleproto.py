@@ -12,10 +12,12 @@ from pibuddy import state as st
 from pibuddy.bleproto import (
     CentralCore,
     LineBuffer,
+    MIN_CHUNK_SIZE,
     PeripheralHandler,
     chunks,
     encode,
     parse,
+    safe_chunk_size,
 )
 from pibuddy.state import StateStore
 
@@ -157,6 +159,58 @@ async def test_central_timeout_returns_none():
     decision = await core.request_approval({"tool_name": "Bash"}, wait=0.1, loop=loop)
     assert decision == "none"
     assert loop.time() - t0 < 12  # bounded, not hanging
+
+
+def test_safe_chunk_size_clamps():
+    assert safe_chunk_size(None) == MIN_CHUNK_SIZE
+    assert safe_chunk_size("garbage") == MIN_CHUNK_SIZE
+    assert safe_chunk_size(0) == MIN_CHUNK_SIZE
+    assert safe_chunk_size(3) == MIN_CHUNK_SIZE  # never below the BLE minimum
+    assert safe_chunk_size(100) == 100
+    assert safe_chunk_size(512) == 180  # never above our frame chunk cap
+    # 20-byte chunks still reassemble fine.
+    msg = {"kind": "event", "payload": {"hook_event_name": "Stop", "session_id": "s1"}}
+    buf = LineBuffer()
+    seen = []
+    for piece in chunks(encode(msg), MIN_CHUNK_SIZE):
+        assert len(piece) <= MIN_CHUNK_SIZE
+        seen += buf.feed(piece)
+    assert parse(seen[0]) == msg
+
+
+@pytest.mark.asyncio
+async def test_bridge_send_line_serializes_frames():
+    """Concurrent frames must not interleave chunks on the UART stream."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "pibuddy_bridge_ser",
+        Path(__file__).resolve().parent.parent / "scripts" / "pibuddy-bridge.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    bridge = mod.Bridge(name="PiBuddy", address=None, port=8766)
+    bridge._chunk_size = 5  # force many chunks per frame
+
+    written: list[bytes] = []
+
+    class FakeClient:
+        is_connected = True
+
+        async def write_gatt_char(self, uuid, data, response=False):
+            written.append(bytes(data))
+            await asyncio.sleep(0)  # yield, inviting interleaving
+
+    bridge.client = FakeClient()
+    line_a = b"A" * 23 + b"\n"
+    line_b = b"B" * 23 + b"\n"
+    await asyncio.gather(bridge._send_line(line_a), bridge._send_line(line_b))
+
+    stream = b"".join(written)
+    # Each frame arrives contiguously: no B bytes inside A's frame or vice versa.
+    frames = stream.split(b"\n")[:-1]
+    assert sorted(frames) == sorted([b"A" * 23, b"B" * 23])
 
 
 def test_bridge_http_app_builds():

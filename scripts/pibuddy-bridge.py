@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aiohttp import web  # noqa: E402
 
-from pibuddy.bleproto import CentralCore, chunks  # noqa: E402
+from pibuddy.bleproto import CentralCore, MIN_CHUNK_SIZE, chunks, safe_chunk_size  # noqa: E402
 from pibuddy.ble import UART_RX, UART_SERVICE, UART_TX  # noqa: E402
 
 log = logging.getLogger("pibuddy.bridge")
@@ -49,14 +49,29 @@ class Bridge:
         self.port = port
         self.client = None
         self.core = CentralCore(self._send_line)
+        self._chunk_size = MIN_CHUNK_SIZE
+        self._write_lock = asyncio.Lock()
 
     # ---------------------------------------------------------- BLE side
 
     async def _send_line(self, line: bytes) -> None:
-        if self.client is None or not self.client.is_connected:
+        client = self.client
+        if client is None or not client.is_connected:
             raise ConnectionError("not connected to the buddy")
-        for piece in chunks(line):
-            await self.client.write_gatt_char(UART_RX, piece, response=False)
+        # One frame at a time: concurrent hook handlers must not interleave
+        # chunks of different newline-framed messages on the UART stream.
+        async with self._write_lock:
+            for piece in chunks(line, self._chunk_size):
+                await client.write_gatt_char(UART_RX, piece, response=False)
+
+    def _negotiated_chunk_size(self, client) -> int:
+        """Respect the connection's max write-without-response size
+        (often just 20 bytes until/without MTU negotiation)."""
+        try:
+            char = client.services.get_characteristic(UART_RX)
+            return safe_chunk_size(getattr(char, "max_write_without_response_size", None))
+        except Exception:
+            return MIN_CHUNK_SIZE
 
     async def ble_loop(self) -> None:
         from bleak import BleakClient, BleakScanner
@@ -78,6 +93,8 @@ class Bridge:
                 log.info("connecting to %s…", address)
                 async with BleakClient(address) as client:
                     self.client = client
+                    self._chunk_size = self._negotiated_chunk_size(client)
+                    log.info("BLE write chunk size: %d bytes", self._chunk_size)
                     await client.start_notify(
                         UART_TX, lambda _, data: self.core.feed(bytes(data))
                     )

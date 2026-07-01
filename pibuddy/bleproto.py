@@ -32,9 +32,13 @@ from .state import StateStore
 
 log = logging.getLogger("pibuddy.bleproto")
 
-# Payload bytes per BLE write/notification. 180 fits comfortably in the
-# common 185-byte usable MTU; receivers reassemble by newline anyway.
+# Upper bound on payload bytes per BLE write/notification. The bridge
+# clamps this down to the size the connection actually negotiated (see
+# safe_chunk_size) — often just 20 bytes on older stacks; receivers
+# reassemble by newline so any chunk size works.
 CHUNK_SIZE = 180
+# The BLE minimum (ATT_MTU 23 - 3 overhead): always safe to send.
+MIN_CHUNK_SIZE = 20
 MAX_LINE = 64 * 1024  # drop anything absurd rather than buffer forever
 MAX_APPROVAL_WAIT = 120.0
 DEFAULT_APPROVAL_WAIT = 45.0
@@ -47,6 +51,21 @@ def encode(message: dict) -> bytes:
 def chunks(data: bytes, size: int = CHUNK_SIZE) -> Iterator[bytes]:
     for i in range(0, len(data), size):
         yield data[i : i + size]
+
+
+def safe_chunk_size(reported: object) -> int:
+    """Clamp a transport-reported max write size to something sane.
+
+    Unknown/garbage values fall back to the BLE minimum of 20 bytes,
+    which every stack accepts.
+    """
+    try:
+        size = int(reported)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return MIN_CHUNK_SIZE
+    if size < MIN_CHUNK_SIZE:
+        return MIN_CHUNK_SIZE
+    return min(size, CHUNK_SIZE)
 
 
 class LineBuffer:
