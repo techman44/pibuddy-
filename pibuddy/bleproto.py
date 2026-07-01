@@ -41,6 +41,10 @@ CHUNK_SIZE = 180
 # The BLE minimum (ATT_MTU 23 - 3 overhead): always safe to send.
 MIN_CHUNK_SIZE = 20
 MAX_LINE = 64 * 1024  # drop anything absurd rather than buffer forever
+# Frames the central will actually send. Payloads are slimmed to fit —
+# the buddy only displays short excerpts, so nothing of value is lost.
+MAX_FRAME = 16 * 1024
+_SLIM_STRING = 1500  # per-string cap when slimming payloads
 MAX_APPROVAL_WAIT = 120.0
 DEFAULT_APPROVAL_WAIT = 45.0
 # How many approval requests a peripheral will hold concurrently.
@@ -70,6 +74,30 @@ def encode(message: dict) -> bytes:
 def chunks(data: bytes, size: int = CHUNK_SIZE) -> Iterator[bytes]:
     for i in range(0, len(data), size):
         yield data[i : i + size]
+
+
+class FrameTooLarge(ValueError):
+    """A frame exceeds MAX_FRAME even after slimming."""
+
+
+def slim_payload(payload: dict, limit: int = _SLIM_STRING) -> dict:
+    """Shrink a hook payload so its frame stays BLE-friendly.
+
+    Long strings (file contents in tool_input, transcripts, context) are
+    truncated and containers capped — far more than the buddy ever
+    renders, tiny enough to always fit under MAX_FRAME.
+    """
+
+    def trim(value, depth=0):
+        if isinstance(value, str) and len(value) > limit:
+            return value[:limit] + "…"
+        if isinstance(value, dict) and depth < 5:
+            return {str(k)[:100]: trim(v, depth + 1) for k, v in list(value.items())[:40]}
+        if isinstance(value, list) and depth < 5:
+            return [trim(v, depth + 1) for v in value[:20]]
+        return value
+
+    return {str(k)[:100]: trim(v) for k, v in payload.items()}
 
 
 def safe_chunk_size(reported: object) -> int:
@@ -239,7 +267,7 @@ class CentralCore:
         self._pending.clear()
 
     async def send_event(self, payload: dict) -> None:
-        await self._send({"kind": "event", "payload": payload})
+        await self._send({"kind": "event", "payload": slim_payload(payload)})
 
     async def request_approval(self, payload: dict, wait: float, loop) -> str:
         import asyncio
@@ -249,7 +277,15 @@ class CentralCore:
         future = loop.create_future()
         self._pending[rid] = future
         try:
-            await self._send({"kind": "approval", "id": rid, "wait": wait, "payload": payload})
+            try:
+                await self._send(
+                    {"kind": "approval", "id": rid, "wait": wait, "payload": slim_payload(payload)}
+                )
+            except FrameTooLarge as exc:
+                # Fail open immediately: never hold the hook for a frame
+                # the peripheral would silently drop.
+                log.warning("approval frame too large, failing open: %s", exc)
+                return "none"
             # Grace must stay under the hook's curl --max-time (wait + 5),
             # or our answer would be written to a closed socket.
             try:
@@ -270,6 +306,9 @@ class CentralCore:
                     future.set_result(str(msg.get("decision") or "none"))
 
     async def _send(self, message: dict) -> None:
-        result = self.send_line(encode(message))
+        line = encode(message)
+        if len(line) > MAX_FRAME:
+            raise FrameTooLarge(f"{len(line)} bytes (max {MAX_FRAME})")
+        result = self.send_line(line)
         if hasattr(result, "__await__"):
             await result

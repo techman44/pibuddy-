@@ -14,6 +14,7 @@ import threading
 from pibuddy.bleproto import (
     CentralCore,
     LineBuffer,
+    MAX_FRAME,
     MIN_CHUNK_SIZE,
     PeripheralHandler,
     chunks,
@@ -21,6 +22,7 @@ from pibuddy.bleproto import (
     encode,
     parse,
     safe_chunk_size,
+    slim_payload,
 )
 from pibuddy.state import StateStore
 
@@ -238,6 +240,72 @@ def test_approval_slots_bounded():
         time.sleep(0.02)
     assert parse(replies[0][:-1]) == {"kind": "decision", "id": "two", "decision": "none"}
     store.resolve_approval("deny")  # release the waiter thread
+
+
+def test_slim_payload_trims_but_keeps_shape():
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "Write",
+        "tool_input": {"file_path": "/x.txt", "content": "A" * 200_000},
+        "pibuddy_context": "B" * 5000,
+    }
+    slim = slim_payload(payload)
+    assert slim["tool_name"] == "Write"
+    assert slim["tool_input"]["file_path"] == "/x.txt"
+    assert len(slim["tool_input"]["content"]) < 2000
+    assert len(slim["pibuddy_context"]) < 2000
+    assert len(encode({"kind": "approval", "id": "x", "payload": slim})) < MAX_FRAME
+
+
+@pytest.mark.asyncio
+async def test_huge_write_approval_roundtrips_after_slimming():
+    """A Write approval with 200KB of content must still reach the buddy
+    (slimmed) instead of being dropped by the peripheral's line guard."""
+    store = StateStore()
+    loop = asyncio.get_running_loop()
+    core = CentralCore(send_line=None)
+    handler = PeripheralHandler(
+        store, lambda line: [loop.call_soon_threadsafe(core.feed, p) for p in chunks(line)]
+    )
+
+    async def central_send(line):
+        for piece in chunks(line):
+            handler.receive(piece)
+
+    core.send_line = central_send
+
+    async def tap():
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if store.snapshot().approvals:
+                store.resolve_approval("allow")
+                return
+        raise AssertionError("approval never appeared")
+
+    tapping = asyncio.ensure_future(tap())
+    decision = await core.request_approval(
+        {"session_id": "s", "tool_name": "Write",
+         "tool_input": {"file_path": "/big.txt", "content": "A" * 200_000}},
+        wait=5, loop=loop,
+    )
+    await tapping
+    assert decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_pathological_approval_fails_open_immediately():
+    """If a frame can't be made to fit even after slimming, the bridge
+    answers 'none' at once instead of holding the hook to timeout."""
+    core = CentralCore(send_line=lambda line: None)
+    loop = asyncio.get_running_loop()
+    # 40 keys x 1500-char strings survive slimming but exceed MAX_FRAME.
+    payload = {f"k{i}": "x" * 1400 for i in range(40)}
+    t0 = loop.time()
+    decision = await core.request_approval(payload, wait=60, loop=loop)
+    assert decision == "none"
+    assert loop.time() - t0 < 1.0  # immediate, not 60s
+    assert not core._pending
 
 
 def test_safe_chunk_size_clamps():
