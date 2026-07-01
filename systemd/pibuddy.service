@@ -1,0 +1,27 @@
+# PiBuddy systemd unit.
+#
+#   sudo cp systemd/pibuddy.service /etc/systemd/system/
+#   sudo systemctl enable --now pibuddy
+#
+# Adjust User/WorkingDirectory to where you cloned the repo. On Pi OS
+# Lite (no desktop), SDL renders straight to the framebuffer via KMS/DRM;
+# on the desktop image, run it from an autostarted terminal instead or
+# set the required XDG/WAYLAND environment for your session.
+
+[Unit]
+Description=PiBuddy - Claude Code desk companion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=video input render
+WorkingDirectory=/home/pi/pibuddy
+ExecStart=/usr/bin/python3 -m pibuddy
+Restart=on-failure
+RestartSec=3
+Environment=SDL_VIDEODRIVER=kmsdrm
+
+[Install]
+WantedBy=multi-user.target
