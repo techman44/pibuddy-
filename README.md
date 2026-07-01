@@ -10,6 +10,27 @@ open, sweats while Claude runs tools, bounces with a "!" when something needs
 your permission — and with a touchscreen you can **approve or deny the pending
 tool call right on the Pi**.
 
+## The flow, in pictures
+
+All screenshots are rendered by the real UI code (regenerate any time with
+`python3 scripts/render-screenshots.py`).
+
+| | |
+|---|---|
+| **1. Asleep.** No sessions anywhere; after the screen dims an ambient clock takes over. ![sleeping](docs/screenshots/01-sleeping.png) | **2. You start working.** A Claude Code session opens, hooks start flowing, Clawd gets busy (note the sweat drop and the session dot up top). ![working](docs/screenshots/02-working.png) |
+| **3. Claude needs you.** A permission prompt is waiting: Clawd bounces with a "!" and the caption changes. ![attention](docs/screenshots/03-attention.png) | **4. You ignored him.** After 30 s the screen edge pulses amber; after 60 s it goes red, he jumps harder, and (if sound is on) beeps every 15 s. ![escalated](docs/screenshots/04-escalated.png) |
+| **5. The approval screen.** What the call is for, the exact command, Claude's last message as context, and Approve / Terminal… / Deny. ![approval](docs/screenshots/05-approval.png) | **6. Task done.** Confetti — and at level 10+ Clawd wears his crown. XP and streaks persist across restarts. ![celebrate](docs/screenshots/06-celebrate.png) |
+| **7. Many terminals?** Buddy grid: one mini-Clawd per session, each with its own mood. ![grid](docs/screenshots/07-buddy-grid.png) | **8. Swipe →** for the live activity feed: prompts, tool calls, notifications, approval verdicts across all sessions. ![feed](docs/screenshots/08-activity-feed.png) |
+| **9. Swipe →** again for stats: streak, activity-by-hour, and a QR code that opens the phone remote. ![stats](docs/screenshots/09-stats-qr.png) | **10. Long-press** anywhere for settings — including a touch **Exit** button, no keyboard needed. ![settings](docs/screenshots/10-settings.png) |
+
+And the phone remote (scan the stats-screen QR), for approving from the couch:
+
+<img src="docs/screenshots/12-phone-remote.png" width="300" alt="phone remote">
+
+The same UI scales down to small panels — the approval screen on a 3.5" 480×320 hat:
+
+<img src="docs/screenshots/05b-approval-small.png" width="480" alt="approval on 480x320">
+
 ## How it works
 
 ```
