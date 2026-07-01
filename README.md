@@ -33,15 +33,28 @@ The same UI scales down to small panels — the approval screen on a 3.5" 480×3
 
 ## How it works
 
+Two transports, same hooks, same features — pick per laptop:
+
 ```
- your laptop(s)                          raspberry pi
-┌───────────────────┐   HTTP (LAN)   ┌──────────────────────────┐
-│ Claude Code       │  ────────────▶ │ pibuddy daemon           │
-│  hooks (curl)     │   /api/event   │  aiohttp server          │
-│                   │ ◀────────────  │  session state machine   │
-│  PreToolUse waits │  /api/approval │  pygame touchscreen UI   │
-└───────────────────┘    decision    └──────────────────────────┘
+ your laptop(s)                                    raspberry pi
+┌────────────────────────────┐                  ┌──────────────────────────┐
+│ Claude Code hooks (curl)   │                  │ pibuddy daemon           │
+│                            │   HTTP (LAN)     │  aiohttp server          │
+│  A) same network ──────────┼────────────────▶ │  session state machine   │
+│                            │                  │  pygame touchscreen UI   │
+│  B) no shared network:     │                  │                          │
+│     hooks ─▶ localhost ─▶ pibuddy-bridge ──┐  │                          │
+│              (same curl)   (persistent BLE)└─▶│  BLE peripheral (--ble)  │
+└────────────────────────────┘   Bluetooth LE   └──────────────────────────┘
 ```
+
+* **A) Network (default):** hooks POST straight to the Pi over the LAN.
+* **B) Bluetooth:** when the laptop and Pi don't share a network, run the
+  small bridge daemon on the laptop. It keeps one persistent BLE connection
+  to the buddy and serves the identical HTTP API on `127.0.0.1:8766`, so the
+  hooks are byte-for-byte the same — they just point at localhost. Approvals
+  flow back over BLE notifications, so touchscreen (and escalation) work
+  identically. See **Bluetooth setup** below.
 
 * Every Claude Code hook event (`SessionStart`, `PreToolUse`, `Stop`, …) is
   forwarded fire-and-forget by `hooks/pibuddy-event.sh` — with a 2 s timeout in
@@ -102,10 +115,10 @@ dim now, reset stats, and **Exit PiBuddy** (no keyboard needed).
   Clawd earns a bow tie at level 3, a party hat at 5, a crown at 10.
 * **mDNS** — the service advertises itself as `pibuddy._http._tcp` on the
   LAN when `zeroconf` is installed.
-* **BLE buddy mode (experimental)** — `--ble` advertises the Pi as a
-  Bluetooth buddy using the upstream Nordic-UART protocol so the Claude
-  **Desktop** app can pair with it like real buddy hardware. Needs
-  `pip install bluezero`; untested scaffold, feedback welcome.
+* **Bluetooth transport** — `--ble` advertises the Pi as a Nordic-UART BLE
+  peripheral, serving both the PiBuddy laptop bridge (full feature parity
+  with the HTTP path, including approvals) and, best-effort, the Claude
+  **Desktop** app's buddy protocol. See **Bluetooth setup**.
 
 ## Setup
 
@@ -139,7 +152,7 @@ Useful flags (also settable in `~/.config/pibuddy/config.json`):
 --ntfy-url URL         push notification when attention goes unanswered
 --relay-after 180      seconds unanswered before the push fires
 --latitude/--longitude weather on the ambient clock (open-meteo)
---ble                  experimental Claude Desktop BLE buddy mode
+--ble                  Bluetooth transport (laptop bridge + Claude Desktop)
 ```
 
 To start on boot, see `systemd/pibuddy.service`. On Pi OS Lite the UI renders
@@ -164,6 +177,49 @@ python3 scripts/install-hooks.py --url http://<pi>:8765 --token SECRET --approva
 that the hook fires for *every* matching tool call, including ones Claude Code
 would have auto-allowed — start with a narrow matcher. Remove everything with
 `--uninstall`.
+
+## Bluetooth setup (no shared network)
+
+Use this when the laptop can't reach the Pi over the network (different
+Wi-Fi, corporate network isolation, café, tethering…). Range is standard
+BLE — roughly the same room, which is exactly where a desk buddy lives.
+
+**On the Pi** — enable the BLE peripheral alongside (or instead of) HTTP:
+
+```bash
+pip install bluezero          # BlueZ D-Bus bindings (Pi OS ships BlueZ)
+python3 -m pibuddy --ble      # or add "ble": true to config.json
+```
+
+**On the laptop** — run the bridge and point the hooks at it:
+
+```bash
+pip install -r requirements-bridge.txt      # bleak + aiohttp
+python3 scripts/pibuddy-bridge.py           # scans for "PiBuddy", stays connected
+python3 scripts/install-hooks.py --url http://127.0.0.1:8766
+```
+
+The bridge auto-reconnects when the buddy comes in and out of range, and
+binds to localhost only. While disconnected it answers hooks immediately
+with the usual fail-open behavior (events dropped, approvals fall back to
+the terminal prompt), so Claude Code never hangs. `--address AA:BB:…` skips
+scanning; `--name` matches a renamed buddy.
+
+To keep the bridge running automatically: on macOS use a LaunchAgent, on
+Linux a `systemd --user` unit wrapping the command above — or just leave it
+in a tmux pane; it's a single quiet process.
+
+There's no need to install hooks for both transports — pick one URL per
+machine. Switching later is just re-running `install-hooks.py` with the
+other URL.
+
+**Status:** the protocol layer (framing, chunked transfer, the approval
+decision round-trip) is fully unit-tested, including a loopback test that
+wires both endpoints together. The radio ends (BlueZ peripheral on the Pi,
+`bleak` central on the laptop) follow those libraries' documented APIs but
+need validation on real hardware — this sandbox has no Bluetooth adapter.
+The same peripheral also answers the Claude **Desktop** app's upstream
+buddy protocol best-effort.
 
 ## Character packs
 

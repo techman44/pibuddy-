@@ -34,9 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     server.start()
 
     if config.ble:
-        from .ble import BleBridge
+        from .ble import BlePeripheral
 
-        BleBridge(store).start()
+        BlePeripheral(store).start()
 
     try:
         Display(store, config).run()
