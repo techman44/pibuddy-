@@ -1,0 +1,33 @@
+# OpenCode — comment-driven agent (/opencode or /oc on an issue or PR comment).
+# runs-on ubuntu-latest resolves to our self-hosted CT310 runner when enrolled.
+name: opencode
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+jobs:
+  opencode:
+    if: |
+      contains(github.event.comment.body, '/oc') ||
+      contains(github.event.comment.body, '/opencode')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Configure git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: litellm-gh/coding
+          use_github_token: true
