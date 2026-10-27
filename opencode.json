@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "litellm-gh": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM (deansdomain.com)",
+      "options": {
+        "baseURL": "https://litellm.deansdomain.com/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      },
+      "models": {
+        "auto": { "name": "Auto (router)" },
+        "coding": { "name": "Coding" },
+        "agent": { "name": "Agent" },
+        "code": { "name": "Code" },
+        "reason": { "name": "Reasoning" },
+        "chat": { "name": "Chat" },
+        "fast": { "name": "Fast" }
+      }
+    }
+  }
+}
