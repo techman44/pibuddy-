@@ -1,0 +1,43 @@
+# OpenCode — issue triage on open.
+# Account-age check (>30 days) filters spam on public repos.
+name: Issue Triage
+on:
+  issues:
+    types: [opened]
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check account age
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = await github.rest.users.getByUsername({
+              username: context.payload.issue.user.login
+            });
+            const created = new Date(user.data.created_at);
+            const days = (Date.now() - created) / (1000 * 60 * 60 * 24);
+            return days >= 30;
+          result-encoding: string
+      - name: Checkout repository
+        if: steps.check.outputs.result == 'true'
+        uses: actions/checkout@v6
+      - name: Run OpenCode
+        if: steps.check.outputs.result == 'true'
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: litellm-gh/fast
+          use_github_token: true
+          prompt: |
+            Triage this issue:
+            - Confirm the report is actionable and restate it precisely
+            - Identify the relevant files/components likely involved
+            - Suggest labels (bug/enhancement/question) and a first response
+            - If information is missing, list exactly what the reporter should provide
