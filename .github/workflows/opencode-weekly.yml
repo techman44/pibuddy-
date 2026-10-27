@@ -1,0 +1,37 @@
+# OpenCode — weekly codebase health scan (Mondays 09:00 UTC) + manual dispatch.
+name: Weekly OpenCode Scan
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Custom instructions for this run
+        required: false
+        default: |
+          Review the codebase for stale TODO/FIXME comments, dead code, and
+          outdated dependencies. Summarize findings. If something is worth
+          tracking, open an issue for it.
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Configure git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: litellm-gh/coding
+          use_github_token: true
+          prompt: ${{ github.event.inputs.prompt || 'Review the codebase for stale TODO/FIXME comments, dead code, and outdated dependencies. Summarize findings. If something is worth tracking, open an issue for it.' }}
