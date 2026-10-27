@@ -1,0 +1,33 @@
+# OpenCode — automatic PR review on open/update.
+# Skips drafts and fork PRs (fork PRs get a read-only token and no secrets).
+name: opencode-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+jobs:
+  review:
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: litellm-gh/code
+          use_github_token: true
+          prompt: |
+            Review this pull request:
+            - Check for code quality issues, bugs, and missing error handling
+            - Look for security problems (secrets in code, injection, unsafe input handling)
+            - Suggest concrete improvements with file/line references
+            Be concise. Only comment on things worth changing.
