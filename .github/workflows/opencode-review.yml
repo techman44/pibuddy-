@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Run OpenCode
-        uses: anomalyco/opencode/github@latest
+        uses: ./.github/actions/opencode
         env:
           LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
